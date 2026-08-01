@@ -175,7 +175,47 @@ re-enable SSH on every Inform (`tools/acs.py` supports this via the
 | `tools/vrv_upload.py` | Config restore uploader (upload.cgi): login → token → upload in one go |
 | `tools/arcadyan_util.py` | Config backup decrypt/encrypt (third-party, from public VRV9517 research) |
 | `payload/keepssh.sh` | Router-side SSH keepalive |
+| `scripts/install-subsystem.sh` | One-click Alpine Linux subsystem (chroot) installer — see below |
 | `docs/walkthrough.md` | Full write-up including every dead end (read this before trying your own variants) |
+
+## Alpine Linux subsystem (chroot)
+
+Once SSH is persistent you can run a complete aarch64 Linux userland on the
+router. All files live in `/data` (a persistent ext4 partition), the stock
+squashfs rootfs is never touched, and uninstalling is `rm -rf`.
+
+Hardware facts that shape the design (measured, not guessed):
+
+- Cortex-A53 × 2, 1 GB RAM (~600 MB free), aarch64 userland, glibc 2.30,
+  kernel 4.19
+- `/data` has ~1.4 GB free and survives reboots
+- The kernel has **no** cgroups, only the `mnt` namespace, no overlayfs, no
+  veth, no TUN — so **Docker and real VMs are impossible**; chroot is the
+  ceiling (near-native speed)
+- The stock firmware's curl/wget are linked against a broken OpenSSL and
+  cannot download anything; Alpine inside the chroot brings its own working
+  TLS stack, so `apk` works fine
+
+Install from a computer on the same LAN:
+
+```bash
+VRV_ROOT_PW='Spark@Modem3' ./scripts/install-subsystem.sh
+# then:
+ssh root@192.168.1.254 /data/enter-alpine.sh
+```
+
+What you get: `apk` package manager, Python/Node/nginx/compiler toolchains,
+a place to run things like Tailscale (userspace mode — no TUN needed) or
+mihomo/sing-box for traffic splitting. Bind-mounts are re-applied after
+every reboot by the keepalive hook.
+
+Want the subsystem to have its own LAN identity? Give the router's LAN
+bridge a secondary IP and bind services to it — to LAN clients it looks
+like a separate machine:
+
+```bash
+ip addr add 192.168.1.253/24 dev br0
+```
 
 ## Gotchas
 
