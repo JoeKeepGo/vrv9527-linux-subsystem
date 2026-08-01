@@ -1,117 +1,120 @@
 # vrv9527-ssh-enable
 
-在新西兰 Spark 淘汰的 **Spark Smart Modem 3（Arcadyan VRV9527，固件 v1.00.08）** 上开启**持久化 root SSH** 的方法与工具。适用于你合法拥有、已解约脱离运营商管理的设备。
+Method and tools to enable **persistent root SSH** on a decommissioned
+**Spark (NZ) Smart Modem 3 (Arcadyan VRV9527, firmware v1.00.08)**.
+Intended for hardware you legally own after leaving the ISP.
 
-> English summary: enables persistent root SSH on the Spark (NZ) Smart Modem 3
-> (Arcadyan VRV9527) by hijacking its TR-069 channel: point the CWMP client at
-> your own ACS, flip the hidden `Device.X_ARC_COM.SSHEnable` flag, then make it
-> survive reboots and the 24-hour auto-close with a cron keepalive installed
-> through a Scheduler config quirk. Details below are in Chinese.
-
-## 攻击链总览
+## Attack chain overview
 
 ```
-Web 管理密码
+Web admin password
    │
    ▼
-配置备份导出/解密/改回传  ──►  把 TR-069 ACS 地址改指到自己的电脑
-   │                              (ARC_TR69_URL)
+Export / decrypt / patch / re-upload config backup
+   │          └── point TR-069 ACS at your own machine (ARC_TR69_URL)
    ▼
-自建最小 CWMP ACS (tools/acs.py)
+Minimal CWMP ACS (tools/acs.py)
    │
-   ├── ConnectionRequest 主动触发路由器开会话（digest 凭据在配置里）
-   ├── GetParameterNames 枚举数据模型
-   │        └── 发现隐藏开关 Device.X_ARC_COM.SSHEnable (Writable=1)
+   ├── ConnectionRequest to force sessions on demand
+   │     (digest credentials are in the config backup)
+   ├── GetParameterNames to enumerate the data model
+   │        └── hidden flag found: Device.X_ARC_COM.SSHEnable (Writable=1)
    ▼
-SetParameterValues SSHEnable=1  ──►  22 端口打开，root 登录
+SetParameterValues SSHEnable=1  ──►  port 22 opens, root login
    │
    ▼
-持久化（全部在路由器本体内）
-   ├── 问题1：ssh 开启后固件挂一个 24 小时自毁看门狗 sshd_delay_close
-   ├── 问题2：重启后 sshd 不会自己启动
-   └── 解法：Scheduler 配置 Time 字段原样拼进 crontab
-            ARC_SYS_SCHEDULER_0_Time="*/5 * * * *"  ← 注入一行合法 cron
-            ARC_SYS_SCHEDULER_0_Command=/bin/sh /data/keepssh.sh
-            → 每次开机自动重建；/data 是 ext4 持久分区，脚本断电不丢
+Persistence (entirely on-router)
+   ├── Problem 1: enabling SSH spawns sshd_delay_close,
+   │   a watchdog that kills SSH after 24 hours
+   ├── Problem 2: sshd does NOT start at boot
+   └── Fix: Scheduler config concatenates "$Time $Command" verbatim
+            into the crontab. Set
+              ARC_SYS_SCHEDULER_0_Time="*/5 * * * *"   ← injects a valid cron line
+              ARC_SYS_SCHEDULER_0_Command=/bin/sh /data/keepssh.sh
+            → rebuilt at every boot; /data is a persistent ext4 partition
 ```
 
-## 前提条件
+## Prerequisites
 
-- 你能登录路由器 Web 管理界面（知道 admin 密码）
-- 知道**出厂主 WiFi 密码**（在机身贴纸上；配置备份用它当加密密钥）
-- 一台和路由器同网段的电脑（macOS/Linux，Python 3 + openssl + curl）
-- 路由器默认 SSH 凭据（固件内置，见第 4 步）
+- Web admin password for the router
+- The **factory main WiFi password** (on the unit's sticker; it is the
+  encryption key for config backups)
+- A computer on the same LAN (macOS/Linux, Python 3 + openssl + curl)
 
-## 使用步骤
+## Steps
 
-### 1. 导出并解密配置备份
+### 1. Export and decrypt the config backup
 
-用 `tools/vrv.py` 登录拿 SID（复刻了路由器登录页的 AES 加密流程），
-然后从 Web 界面"系统备份"页导出 `SmartModem_backup.cfg`，再解密：
+`tools/vrv.py` logs in and prints a session SID (it replicates the login
+page's AES flow). Export `SmartModem_backup.cfg` from the web UI
+("System Backup"), then decrypt:
 
 ```bash
-export VRV_ADMIN_PW='你的admin密码'
+export VRV_ADMIN_PW='your-admin-password'
 SID=$(python3 tools/vrv.py)
 
-# 在 Web UI 导出备份后：
-python3 tools/arcadyan_util.py -d -p '出厂WiFi密码' SmartModem_backup.cfg outdir
-tar xzf outdir/config.tgz -C outdir/x --warning=no-unknown-keyword 2>/dev/null || \
-  (mkdir -p outdir/x && tar xzf outdir/config.tgz -C outdir/x)
-# 主配置：outdir/x/config/.glbcfg
+# After exporting the backup via the web UI:
+python3 tools/arcadyan_util.py -d -p 'factory-wifi-password' SmartModem_backup.cfg outdir
+mkdir -p outdir/x && tar xzf outdir/config.tgz -C outdir/x
+# main config: outdir/x/config/.glbcfg
 ```
 
-> `arcadyan_util.py` 来自公开的 VRV9517 研究（第三方工具，此处仅作转载，
-> VRV9527 与 VRV9517 备份格式一致）。解密时 openssl 的 deprecated key
-> derivation 警告可以忽略。
+> `arcadyan_util.py` is a third-party tool from public VRV9517 research
+> (redistributed here; VRV9527 uses the same backup format). The openssl
+> "deprecated key derivation" warning is harmless.
 
-### 2. 把 TR-069 ACS 指向自己
+### 2. Point TR-069 at your own ACS
 
-编辑 `.glbcfg`：
+Edit `.glbcfg`:
 
 ```
-ARC_TR69_URL=http://<你电脑的IP>:7547/acs
+ARC_TR69_URL=http://<your-computer-IP>:7547/acs
 ```
 
-重新打包（成员结构要和原包一致：uid/gid=0、`.glbcfg` 权限 0666、
-成员顺序不变、GNU tar 格式），然后加密回传：
+Repack the tarball to match the original exactly (uid/gid=0, `.glbcfg`
+mode 0666, original member order, GNU tar format), re-encrypt, upload:
 
 ```bash
-python3 tools/arcadyan_util.py -e -p '出厂WiFi密码' repackdir SmartModem_new.cfg
-# 回传：Web UI 系统恢复页面上传，或用 tools/vrv_upload.py：
+python3 tools/arcadyan_util.py -e -p 'factory-wifi-password' repackdir SmartModem_new.cfg
+# upload via the web UI restore page, or:
 curl -s http://192.168.1.254/logout.cgi -o /dev/null
-python3 tools/vrv_upload.py SmartModem_new.cfg   # 响应会超时，属正常，实际已生效
+python3 tools/vrv_upload.py SmartModem_new.cfg   # response times out — normal, it applied
 ```
 
-> 注意：配置回传有 sanitize 机制，`ARC_SSHD_ENABLE=1` 这类键会被强制回退
-> （这就是为什么要绕到 CWMP 通道）。但 `ARC_TR69_URL` 不在封锁列表里。
+> The restore path sanitizes keys like `ARC_SSHD_ENABLE=1` back to factory
+> values (which is why the CWMP detour is needed), but `ARC_TR69_URL` is
+> not on the blocklist.
 
-### 3. 启动自己的 ACS 并接管 CWMP 会话
+### 3. Run your ACS and take over the CWMP session
 
 ```bash
-python3 tools/acs.py    # 监听 :7547，日志在 /tmp/acs_log/
+python3 tools/acs.py    # listens on :7547, logs to /tmp/acs_log/
 ```
 
-路由器改完 ACS 地址会立即发 `Inform`（VALUE CHANGE）。之后想主动叫它开会话，
-用 ConnectionRequest（凭据就在 `.glbcfg` 里：`ARC_TR69_Username` /
-`ARC_TR69_Password`，wan 侧 8081 端口，内网可通过 WAN IP hairpin 访问）：
+The router sends an `Inform` (VALUE CHANGE) as soon as the URL flips.
+Later, force a session any time with a ConnectionRequest (credentials are
+in `.glbcfg`: `ARC_TR69_Username` / `ARC_TR69_Password`; the listener is on
+the WAN IP, reachable from LAN via NAT hairpin):
 
 ```bash
 curl --digest -u '<ARC_TR69_Username>:<ARC_TR69_Password>' \
-     http://<路由器WAN-IP>:8081/ConnectionRequest
+     http://<router-WAN-IP>:8081/ConnectionRequest
 ```
 
-给 ACS 下命令：把要发的 RPC 写进 `/tmp/acs_next.txt`（第一行方法名，其余为方法体 XML），
-下一次会话的空 POST 时自动发出。枚举数据模型：
+To send an RPC, write it to `/tmp/acs_next.txt` (first line: method name,
+rest: body XML). It goes out on the next empty POST of the session.
+Enumerate the data model:
 
 ```bash
 printf 'cwmp:GetParameterNames\n<ParameterPath>Device.</ParameterPath><NextLevel>1</NextLevel>' \
   > /tmp/acs_next.txt
-# 触发 ConnectionRequest，然后从 /tmp/acs_log/ 读响应
+# fire a ConnectionRequest, read the response in /tmp/acs_log/
 ```
 
-### 4. 打开 SSH
+### 4. Open SSH
 
-枚举结果里能找到厂商隐藏参数 `Device.X_ARC_COM.SSHEnable`（Writable=1）：
+The enumeration reveals the vendor-hidden `Device.X_ARC_COM.SSHEnable`
+(Writable=1):
 
 ```bash
 cat > /tmp/acs_next.txt <<'EOF'
@@ -119,30 +122,30 @@ cwmp:SetParameterValues
 <ParameterList SOAP-ENC:arrayType="cwmp:ParameterValueStruct[1]"><ParameterValueStruct><Name>Device.X_ARC_COM.SSHEnable</Name><Value xsi:type="xsd:boolean">1</Value></ParameterValueStruct></ParameterList><ParameterKey>ssh-on</ParameterKey>
 EOF
 curl --digest -u '<ARC_TR69_Username>:<ARC_TR69_Password>' \
-     http://<路由器WAN-IP>:8081/ConnectionRequest
+     http://<router-WAN-IP>:8081/ConnectionRequest
 ```
 
-22 端口随即打开。固件内置凭据：
+Port 22 opens immediately. Factory-built-in credentials:
 
 ```
-ssh root@192.168.1.254   # 密码 Spark@Modem3
-# 另一组内置账号：rroot / rrs2000RS@)))
+ssh root@192.168.1.254   # password Spark@Modem3
+# second built-in account: rroot / rrs2000RS@)))
 ```
 
-### 5. 持久化（关键，否则白搭）
+### 5. Persistence (the crucial part)
 
-开 SSH 后固件会同时启动 `sshd_delay_close`（24 小时后自动执行
-`mngcli set ARC_SSHD_ENABLE=0` 关掉 SSH）；而且重启后 sshd **不会**自启。
+Enabling SSH also spawns `sshd_delay_close`, which runs
+`mngcli set ARC_SSHD_ENABLE=0` after 24 hours, and sshd does **not** start
+at boot even with `ARC_SSHD_ENABLE=1` in flash.
 
-解法利用了一个配置怪癖：系统 Scheduler 生成 crontab 时是
-`$Time $Command` **原样拼接**成一行。把 `Time` 直接设成 cron 表达式，
-拼出来的就是合法 cron 条目，且 Scheduler 配置持久化、每次开机自动重建：
+The fix abuses a config quirk: the Scheduler writes its crontab entry by
+concatenating `$Time $Command` verbatim. Setting `Time` to a cron
+expression produces a valid cron line, and the Scheduler config is
+persistent and rebuilt at every boot:
 
 ```bash
-# 在路由器 root shell 里：
-cat > /data/keepssh.sh <<'EOF'   # /data 是 ext4 持久分区
-（内容见 payload/keepssh.sh）
-EOF
+# on the router, as root:
+cp keepssh.sh /data/keepssh.sh   # /data is a persistent ext4 partition
 chmod +x /data/keepssh.sh
 
 mngcli set "ARC_SYS_SCHEDULER_0_Command=/bin/sh /data/keepssh.sh"
@@ -151,40 +154,46 @@ mngcli set ARC_SYS_SCHEDULER_0_Enable=1
 mngcli commit
 ```
 
-效果：开机后最多 5 分钟 SSH 自动可用；24 小时看门狗每次出现都会在
-5 分钟内被杀掉；sshd 意外死掉 5 分钟内复活。全程不需要任何外部设备。
+Result: SSH comes up by itself within 5 minutes of boot; the 24h watchdog
+is killed within 5 minutes whenever it appears; sshd is restarted within
+5 minutes if it ever dies. No external device required.
 
-可选增强：缩短 TR-069 心跳并让 ACS 收到 Inform 就自动重开 SSH
-（`tools/acs.py` 已内置该逻辑，用 `/tmp/acs_autossh` flag 文件控制）：
+Optional hardening: shorten the TR-069 periodic inform and have your ACS
+re-enable SSH on every Inform (`tools/acs.py` supports this via the
+`/tmp/acs_autossh` flag file):
 
 ```bash
 # SPV: Device.ManagementServer.PeriodicInformInterval=3600
 ```
 
-## 文件说明
+## Files
 
-| 文件 | 作用 |
+| File | Purpose |
 |---|---|
-| `tools/acs.py` | 最小 CWMP(TR-069) ACS 服务器，支持 Inform/SPV/GPN/GPV，命令队列文件 `/tmp/acs_next.txt` |
-| `tools/vrv.py` | Web 登录器：复刻登录页 spacer GIF 内嵌 AES key/iv/httoken 的加密流程，输出 SID |
-| `tools/vrv_upload.py` | 配置恢复上传（upload.cgi），单进程完成登录→取token→上传 |
-| `tools/arcadyan_util.py` | 配置备份加解密（第三方，源自公开 VRV9517 研究） |
-| `payload/keepssh.sh` | 路由器端 SSH 保活脚本 |
-| `docs/walkthrough.md` | 完整折腾过程记录（含所有失败路径，供参考避坑） |
+| `tools/acs.py` | Minimal CWMP (TR-069) ACS: Inform/SPV/GPN/GPV, command queue file `/tmp/acs_next.txt` |
+| `tools/vrv.py` | Web login: replicates the spacer-GIF AES key/iv/httoken flow, prints a SID |
+| `tools/vrv_upload.py` | Config restore uploader (upload.cgi): login → token → upload in one go |
+| `tools/arcadyan_util.py` | Config backup decrypt/encrypt (third-party, from public VRV9517 research) |
+| `payload/keepssh.sh` | Router-side SSH keepalive |
+| `docs/walkthrough.md` | Full write-up including every dead end (read this before trying your own variants) |
 
-## 注意事项
+## Gotchas
 
-- 修改 `mngcli set` 后记得 `mngcli commit`；直接 `sed` 改 `/etc/config/.glbcfg`
-  会被 mng 内存态在 commit 时覆盖。
-- 配置回传（upload.cgi）对 tar 结构敏感：uid/gid 必须为 0、成员顺序与
-  原包一致，否则秒报 `G_err=-8`（restore failed）。
-- `killall sshd` 会踢掉你自己的 SSH 会话；本机没有 `setsid`/`nohup`，
-  需要"自杀后复活"的测试请交给 cron 去做。
-- 每次开关 SSH（CWMP 或 mngcli），固件都会重新挂出 24 小时看门狗并把
-  `ARC_SSHD_AUTO_DISABLE` 重置为 1——这就是 keepalive 每 5 分钟巡逻的意义。
+- After `mngcli set`, always `mngcli commit`. Editing `/etc/config/.glbcfg`
+  with `sed` is pointless: commit writes the mng daemon's in-memory config
+  and overwrites your edits.
+- The restore path (upload.cgi) is picky about the tarball: uid/gid must be
+  0 and members must be in the original order, or it instantly fails with
+  `G_err=-8` (restore failed).
+- `killall sshd` kills your own SSH session; the box has no `setsid`/`nohup`.
+  Use cron as the detacher for suicide-and-revive tests.
+- Every SSH enable (via CWMP or mngcli) resets `ARC_SSHD_AUTO_DISABLE=1`
+  and respawns the 24h watchdog — that's why the keepalive patrols every
+  5 minutes.
 
-## 免责声明
+## Disclaimer
 
-本项目仅用于你**合法拥有**的设备。把 ACS 地址改指自己之后，原运营商的
-远程管理（TR-069）即失效，这是本项目的预期行为。操作有变砖风险，
-动手前请务必备份配置（加密备份 + 解密后的 `.glbcfg` 各留一份）。
+Use this only on hardware you **legally own**. Repointing the ACS disables
+the ISP's TR-069 remote management — that is the intended effect. There is
+always a risk of bricking; keep both the encrypted backup and a decrypted
+copy of `.glbcfg` before you start.
