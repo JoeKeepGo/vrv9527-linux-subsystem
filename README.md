@@ -132,6 +132,21 @@ ssh root@192.168.1.254   # password Spark@Modem3
 # second built-in account: rroot / rrs2000RS@)))
 ```
 
+> **Security warning — do this before anything else.** The firmware's
+> firewall contains an explicit `ACCEPT ppp0 tcp dpt:22` rule, so the
+> moment SSH is on, it is reachable from the **internet** if your WAN
+> address is public (ours is; the rule's packet counter showed active
+> scanners within days). Lock it down and change the password — both are
+> built into `scripts/install-subsystem.sh` (step 4/6), or manually:
+>
+> ```
+> # block WAN-side SSH (LAN stays reachable); /etc is tmpfs, and the
+> # firewall is rebuilt on boot, so pin both in /data/keepssh.sh —
+> # see the script for the exact idempotent hooks
+> iptables -I INPUT 1 -i ppp0 -p tcp --dport 22 -j DROP
+> passwd   # then persist the resulting /etc/passwd hash via keepalive
+> ```
+
 ### 5. Persistence (the crucial part)
 
 Enabling SSH also spawns `sshd_delay_close`, which runs
@@ -201,7 +216,7 @@ Install from a computer on the same LAN:
 ```bash
 VRV_ROOT_PW='Spark@Modem3' ./scripts/install-subsystem.sh
 # then SSH straight into the subsystem (password: same as router root):
-ssh -p 2222 root@192.168.2.1
+ssh -p 2222 root@192.168.3.1
 # or hop via the router:
 ssh root@192.168.1.254 /data/enter-alpine.sh
 ```
@@ -214,15 +229,17 @@ Boot recovery (all driven by the `/data/keepssh.sh` keepalive hook):
 
 - bind-mounts (`proc/sys/dev/dev/pts`) are re-applied after every reboot
 - the router's LAN bridge gets a **dedicated subsystem IP**,
-  `192.168.2.1/24` on `br0` — its own /24, so LAN clients reach it via
+  `192.168.3.1/24` on `br0` — its own /24, so LAN clients reach it via
   the router's normal address as gateway. This deliberately is *not* a
   second address on the LAN subnet: L2 relays / proxy-ARP boxes between
   client and router refuse to ARP for extra IPs on the router's own
   subnet (verified with a wireless repeater in the path), while an
-  off-subnet address just rides the default gateway and works everywhere
+  off-subnet address just rides the default gateway and works
+  everywhere. (It also can't be 192.168.2.x: that /24 belongs to the
+  guest-wifi bridge `br1`.)
 - `etc/subsystem.autostart` inside the chroot runs **once per boot** —
   put your daemons there. dropbear is pre-installed and auto-started on
-  `192.168.2.1:2222` (port 22 is taken by the host sshd, which binds
+  `192.168.3.1:2222` (port 22 is taken by the host sshd, which binds
   `0.0.0.0`)
 
 Note: a chroot is not a VM — there is no separate "system" to boot.
