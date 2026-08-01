@@ -206,16 +206,25 @@ ssh root@192.168.1.254 /data/enter-alpine.sh
 
 What you get: `apk` package manager, Python/Node/nginx/compiler toolchains,
 a place to run things like Tailscale (userspace mode — no TUN needed) or
-mihomo/sing-box for traffic splitting. Bind-mounts are re-applied after
-every reboot by the keepalive hook.
+mihomo/sing-box for traffic splitting.
 
-Want the subsystem to have its own LAN identity? Give the router's LAN
-bridge a secondary IP and bind services to it — to LAN clients it looks
-like a separate machine:
+Boot recovery (all driven by the `/data/keepssh.sh` keepalive hook):
 
-```bash
-ip addr add 192.168.1.253/24 dev br0
-```
+- bind-mounts (`proc/sys/dev/dev/pts`) are re-applied after every reboot
+- the router's LAN bridge gets a **dedicated subsystem IP**,
+  `192.168.2.253/24` on `br0` — its own /24, so LAN clients reach it via
+  the router's normal address as gateway. This deliberately is *not* a
+  second address on the LAN subnet: L2 relays / proxy-ARP boxes between
+  client and router refuse to ARP for extra IPs on the router's own
+  subnet (verified with a wireless repeater in the path), while an
+  off-subnet address just rides the default gateway and works everywhere
+- `etc/subsystem.autostart` inside the chroot runs **once per boot** —
+  put your daemons there (e.g. `crond`, `dropbear -p 192.168.2.253:22 -R`)
+
+Note: a chroot is not a VM — there is no separate "system" to boot.
+"Autostart" means: after the router reboots, the keepalive remounts the
+filesystem view and fires your autostart script, so anything you run
+comes back by itself.
 
 ## Gotchas
 

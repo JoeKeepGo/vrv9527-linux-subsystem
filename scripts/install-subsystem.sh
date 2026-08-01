@@ -10,6 +10,10 @@
 #   VRV_HOST        router IP            (default 192.168.1.254)
 #   ALPINE_MIRROR   Alpine releases dir  (default dl-cdn latest-stable aarch64)
 #   SUBSYS_DIR      install root on /data (default /data/alpine)
+#   SUBSYS_IP       dedicated subsystem IP (default 192.168.2.253; its own
+#                   /24 so L2 relays/proxy-ARP between you and the router
+#                   can't break it — clients reach it via the router's
+#                   normal address as gateway)
 #
 # What it does (all reversible — see README):
 #   1. downloads the latest Alpine aarch64 minirootfs on YOUR computer
@@ -20,8 +24,9 @@
 #      binary data must go through `cat` unencoded)
 #   3. unpacks it to $SUBSYS_DIR, writes DNS config
 #   4. installs /data/enter-alpine.sh (bind-mounts + chroot entry point)
-#   5. hooks the bind-mounts into /data/keepssh.sh so they come back
-#      after every reboot (idempotent)
+#   5. hooks boot-time recovery into /data/keepssh.sh: bind-mounts, a
+#      dedicated subsystem IP on br0, and a one-shot autostart hook
+#      ($SUBSYS_DIR/etc/subsystem.autostart) — all idempotent
 #
 # Requires on your computer: bash, curl, sshpass, ssh.
 set -euo pipefail
@@ -30,6 +35,7 @@ VRV_HOST="${VRV_HOST:-192.168.1.254}"
 VRV_ROOT_PW="${VRV_ROOT_PW:?set VRV_ROOT_PW to the router root SSH password}"
 ALPINE_MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64}"
 SUBSYS_DIR="${SUBSYS_DIR:-/data/alpine}"
+SUBSYS_IP="${SUBSYS_IP:-192.168.2.253}"
 
 command -v sshpass >/dev/null || { echo "need sshpass (macOS: brew install hudochenkov/sshpass/sshpass; Debian/Ubuntu: apt install sshpass)"; exit 1; }
 command -v curl    >/dev/null || { echo "need curl"; exit 1; }
@@ -77,8 +83,27 @@ exec chroot "\$R" /bin/sh -l
 EOS
 chmod +x /data/enter-alpine.sh
 
-# hook into the SSH keepalive so bind-mounts are restored after reboot
-if [ -f /data/keepssh.sh ] && ! grep -q "alpine subsystem" /data/keepssh.sh; then
+# autostart template: runs once per boot inside the chroot
+cat > $SUBSYS_DIR/etc/subsystem.autostart <<EOS
+#!/bin/sh
+# Runs once per router boot, inside the Alpine chroot (as root), after
+# bind-mounts are restored. Started by /data/keepssh.sh.
+# Services can bind the dedicated IP $SUBSYS_IP — LAN clients reach it
+# via the router's address as gateway, so L2 relays / proxy-ARP boxes
+# between client and router can't break it (a secondary IP on the
+# router's own subnet would not survive such relays).
+#
+# Examples (apk add first):
+#   /usr/sbin/crond
+#   /usr/sbin/dropbear -p $SUBSYS_IP:22 -R
+EOS
+chmod +x $SUBSYS_DIR/etc/subsystem.autostart
+
+# hook into the SSH keepalive so everything comes back after reboot.
+# keepssh.sh ends with "exit 0" — strip it or appended hooks never run.
+if [ -f /data/keepssh.sh ]; then
+sed -i '/^exit 0$/d' /data/keepssh.sh
+if ! grep -q "alpine subsystem" /data/keepssh.sh; then
 cat >> /data/keepssh.sh <<EOS
 
 # alpine subsystem bind mounts
@@ -88,9 +113,25 @@ if [ -d $SUBSYS_DIR ]; then
     grep -q " $SUBSYS_DIR/\$d " /proc/mounts || mount --bind "/\$d" "$SUBSYS_DIR/\$d" 2>/dev/null
   done
 fi
+
+# alpine subsystem: dedicated IP on its own /24
+if command -v ip >/dev/null 2>&1 && ! ip addr show br0 | grep -q "$SUBSYS_IP"; then
+  ip addr add $SUBSYS_IP/24 dev br0 2>/dev/null
+fi
+
+# alpine subsystem: run user autostart once per boot (/tmp is cleared on reboot)
+if [ -x $SUBSYS_DIR/etc/subsystem.autostart ] && [ ! -f /tmp/alpine_started ]; then
+  touch /tmp/alpine_started
+  echo "\$(date) running alpine autostart" >> /data/keepssh.log
+  chroot $SUBSYS_DIR /bin/sh -l /etc/subsystem.autostart >> /data/keepssh.log 2>&1 &
+fi
 EOS
 fi
+fi
 REMOTE
+
+# bring up the dedicated IP right away (the hook redoes it after reboots)
+$SSH "ip addr show br0 | grep -q '$SUBSYS_IP' || ip addr add $SUBSYS_IP/24 dev br0"
 
 echo "[5/5] smoke test..."
 $SSH "grep -q ' $SUBSYS_DIR/proc ' /proc/mounts || mount --bind /proc $SUBSYS_DIR/proc; chroot $SUBSYS_DIR /bin/sh -c 'cat /etc/alpine-release'"
@@ -100,4 +141,9 @@ echo "Done. Enter the subsystem with:"
 echo "  ssh root@$VRV_HOST /data/enter-alpine.sh"
 echo "Inside, 'apk update && apk add <pkg>' works (Alpine brings its own"
 echo "working TLS stack — the stock firmware's broken one is bypassed)."
+echo ""
+echo "Autostart: put commands in $SUBSYS_DIR/etc/subsystem.autostart —"
+echo "they run once per router boot inside the chroot."
+echo "Dedicated IP: services can bind $SUBSYS_IP (own /24, reached via the"
+echo "router as gateway; survives L2 relays that break proxy-ARP)."
 echo "Uninstall: ssh root@$VRV_HOST 'rm -rf $SUBSYS_DIR /data/enter-alpine.sh'"
