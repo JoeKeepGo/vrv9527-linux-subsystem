@@ -191,6 +191,25 @@ re-enable SSH on every Inform (`tools/acs.py` supports this via the
   and respawns the 24h watchdog — that's why the keepalive patrols every
   5 minutes.
 
+## Original ISP/vendor endpoints (kept for reference)
+
+If you ever want to restore the stock remote-management / firmware-update
+channels, these are the factory values found in the config backup
+(`.glbcfg`). The eMMC A/B layout means a firmware upgrade only replaces
+the inactive bank; the persistence setup in this repo lives in the config
+store and `/data`, so it survives bank switches — but a *new* firmware
+version may of course patch the CWMP flag or the Scheduler quirk.
+
+| Channel | Config key | Factory value |
+|---|---|---|
+| Spark TR-069 ACS | `ARC_TR69_URL` | `http://acs-v.spark.co.nz:7547/cpe.php` |
+| Skinny auto firmware check | `ARC_SYS_AUTOFW_Url` | `http://firmware.broadbandunlimited.nz/firmware/skinny-LRDD/version.txt` (Enable defaults to 0) |
+| Arcadyan OWL cloud | `ARC_OWL_CLOUD_URL` | `https://jasontplg.arciot.com:55668` (Enable defaults to 0) |
+
+To re-enable ISP management: restore `ARC_TR69_URL` via config restore or
+`mngcli set ARC_TR69_URL=<value>; mngcli commit`, and reboot or wait for
+the next periodic inform.
+
 ## Disclaimer
 
 Use this only on hardware you **legally own**. Repointing the ACS disables
