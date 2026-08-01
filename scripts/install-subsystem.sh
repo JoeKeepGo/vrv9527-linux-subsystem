@@ -27,6 +27,9 @@
 #   5. hooks boot-time recovery into /data/keepssh.sh: bind-mounts, a
 #      dedicated subsystem IP on br0, and a one-shot autostart hook
 #      ($SUBSYS_DIR/etc/subsystem.autostart) — all idempotent
+#   6. installs dropbear inside the chroot for direct SSH access on
+#      $SUBSYS_IP:2222 (port 22 is taken by the host sshd, which binds
+#      0.0.0.0). Root password is set to $VRV_ROOT_PW.
 #
 # Requires on your computer: bash, curl, sshpass, ssh.
 set -euo pipefail
@@ -35,7 +38,7 @@ VRV_HOST="${VRV_HOST:-192.168.1.254}"
 VRV_ROOT_PW="${VRV_ROOT_PW:?set VRV_ROOT_PW to the router root SSH password}"
 ALPINE_MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64}"
 SUBSYS_DIR="${SUBSYS_DIR:-/data/alpine}"
-SUBSYS_IP="${SUBSYS_IP:-192.168.2.253}"
+SUBSYS_IP="${SUBSYS_IP:-192.168.2.1}"
 
 command -v sshpass >/dev/null || { echo "need sshpass (macOS: brew install hudochenkov/sshpass/sshpass; Debian/Ubuntu: apt install sshpass)"; exit 1; }
 command -v curl    >/dev/null || { echo "need curl"; exit 1; }
@@ -93,9 +96,12 @@ cat > $SUBSYS_DIR/etc/subsystem.autostart <<EOS
 # between client and router can't break it (a secondary IP on the
 # router's own subnet would not survive such relays).
 #
-# Examples (apk add first):
+# Direct SSH into the subsystem (port 2222; 22 is taken by the host
+# sshd which binds 0.0.0.0):
+/usr/sbin/dropbear -p $SUBSYS_IP:2222 -R
+#
+# More examples (apk add first):
 #   /usr/sbin/crond
-#   /usr/sbin/dropbear -p $SUBSYS_IP:22 -R
 EOS
 chmod +x $SUBSYS_DIR/etc/subsystem.autostart
 
@@ -133,17 +139,26 @@ REMOTE
 # bring up the dedicated IP right away (the hook redoes it after reboots)
 $SSH "ip addr show br0 | grep -q '$SUBSYS_IP' || ip addr add $SUBSYS_IP/24 dev br0"
 
+# dropbear for direct SSH into the subsystem on $SUBSYS_IP:2222
+# (root password = the router root password)
+$SSH "chroot $SUBSYS_DIR /sbin/apk add dropbear >/dev/null 2>&1 || true"
+echo "root:$VRV_ROOT_PW" | $SSH "chroot $SUBSYS_DIR /usr/sbin/chpasswd"
+$SSH "pidof dropbear >/dev/null 2>&1 || chroot $SUBSYS_DIR /usr/sbin/dropbear -p $SUBSYS_IP:2222 -R"
+
 echo "[5/5] smoke test..."
 $SSH "grep -q ' $SUBSYS_DIR/proc ' /proc/mounts || mount --bind /proc $SUBSYS_DIR/proc; chroot $SUBSYS_DIR /bin/sh -c 'cat /etc/alpine-release'"
 
 echo ""
-echo "Done. Enter the subsystem with:"
+echo "Done. Direct SSH into the subsystem:"
+echo "  ssh -p 2222 root@$SUBSYS_IP      (password: same as router root)"
+echo "Or hop via the router:"
 echo "  ssh root@$VRV_HOST /data/enter-alpine.sh"
 echo "Inside, 'apk update && apk add <pkg>' works (Alpine brings its own"
 echo "working TLS stack — the stock firmware's broken one is bypassed)."
 echo ""
 echo "Autostart: put commands in $SUBSYS_DIR/etc/subsystem.autostart —"
-echo "they run once per router boot inside the chroot."
+echo "they run once per router boot inside the chroot (dropbear is"
+echo "already in there)."
 echo "Dedicated IP: services can bind $SUBSYS_IP (own /24, reached via the"
 echo "router as gateway; survives L2 relays that break proxy-ARP)."
 echo "Uninstall: ssh root@$VRV_HOST 'rm -rf $SUBSYS_DIR /data/enter-alpine.sh'"

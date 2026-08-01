@@ -200,7 +200,9 @@ Install from a computer on the same LAN:
 
 ```bash
 VRV_ROOT_PW='Spark@Modem3' ./scripts/install-subsystem.sh
-# then:
+# then SSH straight into the subsystem (password: same as router root):
+ssh -p 2222 root@192.168.2.1
+# or hop via the router:
 ssh root@192.168.1.254 /data/enter-alpine.sh
 ```
 
@@ -212,14 +214,16 @@ Boot recovery (all driven by the `/data/keepssh.sh` keepalive hook):
 
 - bind-mounts (`proc/sys/dev/dev/pts`) are re-applied after every reboot
 - the router's LAN bridge gets a **dedicated subsystem IP**,
-  `192.168.2.253/24` on `br0` — its own /24, so LAN clients reach it via
+  `192.168.2.1/24` on `br0` — its own /24, so LAN clients reach it via
   the router's normal address as gateway. This deliberately is *not* a
   second address on the LAN subnet: L2 relays / proxy-ARP boxes between
   client and router refuse to ARP for extra IPs on the router's own
   subnet (verified with a wireless repeater in the path), while an
   off-subnet address just rides the default gateway and works everywhere
 - `etc/subsystem.autostart` inside the chroot runs **once per boot** —
-  put your daemons there (e.g. `crond`, `dropbear -p 192.168.2.253:22 -R`)
+  put your daemons there. dropbear is pre-installed and auto-started on
+  `192.168.2.1:2222` (port 22 is taken by the host sshd, which binds
+  `0.0.0.0`)
 
 Note: a chroot is not a VM — there is no separate "system" to boot.
 "Autostart" means: after the router reboots, the keepalive remounts the
